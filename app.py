@@ -6,18 +6,23 @@ import io
 import pandas as pd
 import streamlit as st
 
-from rstl import analysis, loader, sections as SEC
+from rstl import analysis, loader, sections as SEC, ui
 from rstl.export import to_pdf, to_pptx, to_xlsx
 
 st.set_page_config(page_title="RSTL Profitability", layout="wide")
-st.title("RSTL Profitability Report")
+ui.inject()
 
-up = st.sidebar.file_uploader("RSTL tracker (.xlsx)", type=["xlsx"])
-if not up:
-    st.caption("Upload the RSTL tracker workbook. It needs SALES and PURCHASES sheets in the usual layout.")
-    st.info("Upload the tracker in the sidebar to generate the report.")
-    st.stop()
-data = up.getvalue()
+if "file_bytes" not in st.session_state:
+    ui.hero()
+    ui.features()
+    ui.upload_heading()
+    up = st.file_uploader("Drop the RSTL tracker here (.xlsx)", type=["xlsx"], key="first_upload")
+    if not up:
+        ui.steps()
+        st.stop()
+    st.session_state["file_bytes"], st.session_state["file_name"] = up.getvalue(), up.name
+    st.rerun()  # file received: reload into the report view
+data, fname = st.session_state["file_bytes"], st.session_state["file_name"]
 fhash = hashlib.md5(data).hexdigest()
 
 
@@ -50,8 +55,13 @@ def build(_S, _P, key):
 B = build(S, P, (fhash, round(rate, 6), str(asof.date())))
 secs = {s.key: s for s in B["secs"]}
 
-# ---- master report downloads, always visible
-st.caption(f"Period: {B['period']}")
+ui.banner(B["period"], fname)
+with st.expander("Change the workbook"):
+    new = st.file_uploader("Replace the RSTL tracker (.xlsx)", type=["xlsx"], key="replace_upload")
+    if new is not None and hashlib.md5(new.getvalue()).hexdigest() != fhash:
+        st.session_state["file_bytes"], st.session_state["file_name"] = new.getvalue(), new.name
+        st.rerun()
+st.write("")
 c1, c2, c3 = st.columns(3)
 c1.download_button("Download master report (PowerPoint)", B["master_pptx"], "RSTL_Master_Report.pptx",
                    "application/vnd.openxmlformats-officedocument.presentationml.presentation", type="primary", width="stretch")
@@ -62,14 +72,12 @@ c3.download_button("Download all tables (Excel)", B["xlsx"], "RSTL_Tables.xlsx",
 tabs = st.tabs([s.title for s in B["secs"]])
 for tab, s in zip(tabs, B["secs"]):
     with tab:
-        top, dl = st.columns([4, 1])
+        top, dl = st.columns([2, 1])
         top.subheader(s.title)
         dl.download_button("Download this section (PDF)", B["pdfs"][s.key], f"RSTL_{s.key}.pdf", "application/pdf",
                            key=f"dl_{s.key}", width="stretch")
         if s.kpis:
-            cols = st.columns(len(s.kpis))
-            for col, (lab, val, note) in zip(cols, s.kpis):
-                col.metric(lab, val, note, delta_color="off")
+            ui.kpi_grid(s.kpis)
         for p in s.paras:
             st.markdown(p if s.key != "notes" else f"- {p}")
         for f in s.figs:
