@@ -18,18 +18,24 @@ def _title(ax, *a, **k):
     return None
 
 
+def _pcolors(R):
+    """One fixed colour per product (largest by litres first), used by every product chart."""
+    order = R["S"][~R["S"].Loss].groupby("Prod").Qty.sum().sort_values(ascending=False).index
+    return {p: th.CAT[i % len(th.CAT)] for i, p in enumerate(order)}
+
+
 def _note_partial(ax, R):
     if R["M"].Partial.any():
         ax.annotate("* partial month", xy=(1, -0.13), xycoords="axes fraction", ha="right", fontsize=8.5, color=th.GREY)
 
 
-def _donut(ax, labels, values, title, fmt, center=None):
+def _donut(ax, labels, values, title, fmt, center=None, colors=None):
     vals = np.array(values, float)
     ax.set_title(title, fontsize=12, loc="center", pad=6)
     ax.grid(False)
     if (vals <= 0).any():
         ax.axis("off"); ax.text(.5, .5, "n/a (negative values)", ha="center", color=th.GREY); return
-    cols = th.CAT[:len(vals)]
+    cols = colors or th.CAT[:len(vals)]
     wedges, _ = ax.pie(vals, colors=cols, startangle=90, counterclock=False,
                        wedgeprops=dict(width=.38, edgecolor="white", linewidth=2))
     tot = vals.sum()
@@ -89,12 +95,30 @@ def margin_per_litre(R):
     S = R["S"]; S = S[~S.Loss]
     g = S.groupby(["Month", "Prod"]).apply(lambda d: d.NM.sum() / d.Qty.sum(), include_groups=False).unstack()
     f, ax = th.fig(); labs = _labs(R); pos = {m: i for i, m in enumerate(R["M"].index)}
-    for c, p in zip(th.CAT, g.columns):
+    pc = _pcolors(R)
+    for p in pc:
+        if p not in g.columns:
+            continue
         s = g[p].dropna()
-        ax.plot([pos[i] for i in s.index], s.values, marker="o", lw=2.4, color=c, label=p)
+        ax.plot([pos[i] for i in s.index], s.values, marker="o", lw=2.4, color=pc[p], label=p)
     ax.axhline(0, color=th.INK2, lw=1)
     ax.set_xticks(list(pos.values())); ax.set_xticklabels(labs); ax.set_ylabel("GHS per litre")
     _title(ax, "Net margin per litre by product"); ax.legend(loc="best"); _note_partial(ax, R); return f
+
+
+def margin_by_product(R):
+    """Total net margin (GHS m) per product per month; same layout as margin_per_litre."""
+    S = R["S"]; S = S[~S.Loss]
+    g = S.groupby(["Month", "Prod"]).NM.sum().unstack()
+    order = S.groupby("Prod").NM.sum().sort_values(ascending=False).index
+    f, ax = th.fig(); labs = _labs(R); pos = {m: i for i, m in enumerate(R["M"].index)}
+    pc = _pcolors(R)
+    for p in [p for p in pc if p in g.columns]:
+        s = g[p].dropna()
+        ax.plot([pos[i] for i in s.index], s.values / 1e6, marker="o", lw=2.4, color=pc[p], label=p)
+    ax.axhline(0, color=th.INK2, lw=1)
+    ax.set_xticks(list(pos.values())); ax.set_xticklabels(labs); ax.set_ylabel("GHS million")
+    _title(ax, "Total net margin by product"); ax.legend(loc="best"); _note_partial(ax, R); return f
 
 
 def price_vs_cost(R):
@@ -103,10 +127,10 @@ def price_vs_cost(R):
     f, axes = plt.subplots(1, len(prods), figsize=(11, 4.4), sharex=False)
     axes = np.atleast_1d(axes)
     for ax, p in zip(axes, prods):
-        d = S[S.Prod == p].groupby("Month").apply(lambda d: pd.Series({"asp": d.Rev.sum() / d.Qty.sum(), "acp": d.Cogs.sum() / d.Qty.sum()}), include_groups=False)
+        d = S[S.Prod == p].groupby("Month").apply(lambda d: pd.Series({"asp": d.Rev.sum() / d.Qty.sum(), "acp": (d.Cogs.sum() + d.Other.sum() + d.Fin.sum()) / d.Qty.sum()}), include_groups=False)
         x = np.arange(len(d))
         ax.plot(x, d.asp, color=th.BLUE, marker="o", lw=2.3, label="Avg selling price")
-        ax.plot(x, d.acp, color=th.ORANGE, marker="o", lw=2.3, label="Avg product cost")
+        ax.plot(x, d.acp, color=th.ORANGE, marker="o", lw=2.3, label="Avg total cost")
         ax.fill_between(x, d.acp, d.asp, where=d.asp >= d.acp, color=th.GOOD, alpha=.18, interpolate=True)
         ax.fill_between(x, d.acp, d.asp, where=d.asp < d.acp, color=th.BAD, alpha=.25, interpolate=True)
         ax.set_xticks(x); ax.set_xticklabels([i.strftime("%b") for i in d.index], fontsize=9)
@@ -191,9 +215,10 @@ def product_split(R):
     vol = R["cuts"]["prod"].Vol.reindex(fp.index).fillna(0)
     nm = fp.NM
     f, axes = plt.subplots(1, 3, figsize=(11, 4.9))
-    _donut(axes[0], list(vol.index), vol.values, "Litres sold", lambda v: f"{v/1e6:,.1f}m L")
-    _donut(axes[1], list(fp.index), fp.Facility.values, "Bank facility drawn", lambda v: f"GHS {v/1e6:,.0f}m")
-    _donut(axes[2], list(nm.index), nm.values, "Net margin", lambda v: f"GHS {v/1e6:,.1f}m")
+    pc = _pcolors(R); cols = [pc.get(p, th.GREY) for p in fp.index]
+    _donut(axes[0], list(vol.index), vol.values, "Litres sold", lambda v: f"{v/1e6:,.1f}m L", colors=cols)
+    _donut(axes[1], list(fp.index), fp.Facility.values, "Bank facility drawn", lambda v: f"GHS {v/1e6:,.0f}m", colors=cols)
+    _donut(axes[2], list(nm.index), nm.values, "Net margin", lambda v: f"GHS {v/1e6:,.1f}m", colors=cols)
     f.tight_layout(); return f
 
 
@@ -255,8 +280,13 @@ def funding_by_month(R):
 
 def interest_by_trade(R):
     T = R["T"]; f, ax = th.fig(11, 4.4); x = np.arange(len(T))
-    ax.bar(x, T.Rec.fillna(0) / 1e3, color=th.NAVY, width=.7, label="Recorded in PURCHASES")
-    ax.bar(x, (T.Est.fillna(0) + T.Accr.fillna(0)) / 1e3, bottom=T.Rec.fillna(0) / 1e3, color=th.ORANGE, width=.7, label="Estimated / accrued")
+    if R["tot"]["fin_source"] == "workbook":
+        w = .38
+        ax.bar(x - w / 2, T.FinW / 1e3, w, color=th.NAVY, label="Workbook Facility Cost (used in report)")
+        ax.bar(x + w / 2, T.FinP / 1e3, w, color=th.ORANGE, label="Interest per PURCHASES (booked + estimated)")
+    else:
+        ax.bar(x, T.Rec.fillna(0) / 1e3, color=th.NAVY, width=.7, label="Recorded in PURCHASES")
+        ax.bar(x, (T.Est.fillna(0) + T.Accr.fillna(0)) / 1e3, bottom=T.Rec.fillna(0) / 1e3, color=th.ORANGE, width=.7, label="Estimated / accrued")
     ax.set_xticks(x); ax.set_xticklabels(T.index, rotation=70, ha="right", fontsize=8.5)
     ax.set_ylabel("GHS thousand"); _title(ax, "RSTL financing cost by trade"); ax.legend(loc="upper left"); return f
 

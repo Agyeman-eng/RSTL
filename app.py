@@ -31,6 +31,11 @@ def read(b):
     return loader.load(io.BytesIO(b))
 
 
+@st.cache_data(show_spinner=False)
+def read_qty(b):
+    return loader.load_rstl_qty(io.BytesIO(b))
+
+
 try:
     S, P = read(data)
 except Exception as e:  # noqa: BLE001
@@ -38,21 +43,38 @@ except Exception as e:  # noqa: BLE001
     st.stop()
 
 st.sidebar.markdown("**Assumptions**")
-rate = st.sidebar.number_input("Interest rate (% p.a.)", 0.0, 40.0, round(loader.infer_rate(P) * 100, 2), 0.01,
-                               help="Detected from drawdowns with interest already booked. Used only where interest is missing.") / 100
+found = loader.infer_rates(P)
+rate = {}
+for fu, r0 in found.items():
+    rate[fu] = st.sidebar.number_input(f"Interest rate, {fu} (% p.a.)", 0.0, 40.0, round(r0 * 100, 2), 0.01, key=f"rate_{fu}",
+                                       help="Detected from drawdowns with interest already booked. Used only where interest is missing.") / 100
+rstl_qty = read_qty(data)
+sold_all = S.groupby("ID").Qty.sum()
+has_outside = rstl_qty is not None and bool(((sold_all - rstl_qty.reindex(sold_all.index)).abs() > 0.5).any())
+basis_label = st.sidebar.radio("Loadings included", ["RSTL litres only", "All loadings in SALES"], index=0 if rstl_qty is not None else 1,
+                               disabled=rstl_qty is None,
+                               help="SALES holds every loading, including stock bought outside RSTL. RSTL only uses Sheet4's Total OMC loadings (SALES minus litres bought outside RSTL)."
+                                    + ("" if rstl_qty is not None else " Sheet4 'Total OMC loadings' was not found, so all loadings are used."))
+basis = "rstl" if basis_label.startswith("RSTL") else "all"
+fac_ok = loader.facility_ok(S)
+src_label = st.sidebar.radio("Financing cost source", ["Workbook (Facility Cost column)", "Rebuilt from PURCHASES interest"],
+                             index=0 if fac_ok else 1, disabled=not fac_ok,
+                             help="Workbook: net margin matches the sheet's Total Margin. Rebuilt: uses interest booked in PURCHASES, estimating gaps at the rates above."
+                                  + ("" if fac_ok else " The Facility Cost column in this file is not a clean per-litre figure, so the rebuilt option is used."))
+fin_source = "workbook" if src_label.startswith("Workbook") else "purchases"
 asof = pd.Timestamp(st.sidebar.date_input("Accrue open loans to", S.Date.max().date()))
 
 
 @st.cache_resource(show_spinner="Building charts and reports (about 20 seconds the first time)")
 def build(_S, _P, key):
-    R = analysis.analyse(_S, _P, rate, asof)
+    R = analysis.analyse(_S, _P, rate, asof, fin_source, rstl_qty, basis)
     secs, period = SEC.build_sections(R)
     pdfs = {s.key: to_pdf([s], period=period, cover=False) for s in secs}
     return dict(R=R, secs=secs, period=period, pdfs=pdfs, master_pdf=to_pdf(secs, period=period),
                 master_pptx=to_pptx(secs, period=period), xlsx=to_xlsx(R, secs))
 
 
-B = build(S, P, (fhash, round(rate, 6), str(asof.date())))
+B = build(S, P, (fhash, tuple(round(v, 6) for v in rate.values()), str(asof.date()), fin_source, basis))
 secs = {s.key: s for s in B["secs"]}
 
 ui.banner(B["period"], fname)

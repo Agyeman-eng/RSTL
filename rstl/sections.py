@@ -3,7 +3,7 @@ To add a chart or table, write the function in charts.py and add one line here."
 from dataclasses import dataclass, field
 import pandas as pd
 from . import charts as C, theme as th
-from .narrative import narrative, checks
+from .narrative import narrative, checks, rate_text
 
 
 @dataclass
@@ -47,7 +47,7 @@ def build_sections(R):
 
     # ---- summary
     s0 = Section("summary", "Executive summary", paras=narrative(R), kpis=[
-        ("Volume sold", f"{t['vol']/1e6:,.1f}m L", f"{t['vol']/t['pq']:.0%} of {t['pq']/1e6:,.1f}m L purchased"),
+        ("Volume sold" + (" (RSTL)" if t["basis"] == "rstl" else ""), f"{t['vol']/1e6:,.1f}m L", f"{t['vol']/t['pq']:.0%} of {t['pq']/1e6:,.1f}m L purchased"),
         ("Sales", f"GHS {t['rev']/1e6:,.1f}m", f"Avg GHS {t['rev']/t['vol']:.2f}/L"),
         ("Margin before financing", f"GHS {t['gm']/1e6:,.1f}m", f"{t['gm']/t['rev']:.1%} of sales"),
         ("Financing cost", f"GHS {t['fin']/1e6:,.2f}m", f"{t['fin']/t['gm']:.0%} of pre-financing margin"),
@@ -76,10 +76,17 @@ def build_sections(R):
         _fig("Monthly sales", f"Sales of GHS {t['rev']/1e6:,.1f}m at an average realised price of GHS {t['rev']/t['vol']:.2f} per litre.", C.sales_by_month(R)),
         _fig("Monthly net margin (GHS m and % of sales)", f"{full.NM.idxmax().strftime('%B')} was the best full month (GHS {full.NM.max()/1e6:,.1f}m). "
              + (f"Loss in {', '.join(i.strftime('%B') for i in bad.index)}." if len(bad) else "No full month made a loss."), C.net_margin_by_month(R)),
+        _fig("Total net margin by product per month (GHS m)", _prod_caption(R), C.margin_by_product(R)),
         _fig("Margin per litre by product", "Net margin per litre after licence costs and financing. Falling lines mean the spread is narrowing.", C.margin_per_litre(R)),
-        _fig("Selling price vs product cost per litre", "Green shading is a positive spread; red is selling below cost.", C.price_vs_cost(R)),
+        _fig("Selling price vs total cost per litre", "Total cost per litre = product cost + licence and other costs + financing (the Total Cost/Ltr in the sheet). "
+             "The gap is the net margin per litre: green shading is profit, red is selling below total cost.", C.price_vs_cost(R)),
         _fig("Cumulative net margin", _half(R), C.cumulative(R))]
     mt = M.copy(); mt.index = [i.strftime("%b %Y") + (" (partial)" if p else "") for i, p in zip(M.index, M.Partial)]
+    pm = S[~S.Loss].groupby(["Prod", "Month"]).NM.sum().unstack(0).reindex(M.index).fillna(0)
+    pm = pm[pm.sum().sort_values(ascending=False).index]
+    pm.index = [i.strftime("%b %Y") + (" (partial)" if p else "") for i, p in zip(M.index, M.Partial)]
+    pmt = pm.map(n0); pmt["Total"] = pm.sum(axis=1).map(n0)
+    s2.tables.append(Tbl("Net margin by product and month (GHS)", pmt.reset_index(names="Month")))
     s2.tables.append(Tbl("Monthly profit and loss (GHS)", pd.DataFrame({
         "Litres sold": mt.Vol.map(n0), "Sales": mt.Rev.map(n0), "Product cost": mt.Cogs.map(n0), "Licence & other": mt.Other.map(n0),
         "Margin pre-fin.": mt.GM.map(n0), "Financing": mt.Fin.map(n0), "Net margin": mt.NM.map(n0), "Net % sales": mt.NMpct.map(pc), "Net GHS/L": mt.NMpl.map(n2)}).reset_index(names="Month")))
@@ -98,6 +105,15 @@ def build_sections(R):
         "Sold L": d.Sold.map(n0).values, "Sales": d.Rev.map(n0).values, "Margin pre-fin.": d.GM.map(n0).values, "Financing": d.Fin.map(n0).values,
         "Net margin": d.NM.map(n0).values, "Net GHS/L": d.NMpl.map(n2).values, "Net %": d.NMpct.map(pc).values, "Days": d.DaysToSell.map(n0).values,
         "Status": d.Status.values})))
+
+    if t["basis"] == "rstl":
+        sd = t["sheet_diff"]; ox = T[T.Outside.abs() > 0.5].copy()
+        if len(ox):
+            ox["sh"] = ox.Outside / ox.SoldAll
+            s3.tables.append(Tbl("Loadings bought outside RSTL, excluded from this report", pd.DataFrame({
+                "Trade": ox.index, "Loaded per SALES (L)": ox.SoldAll.map(n0).values, "Bought outside RSTL (L)": ox.Outside.map(n0).values,
+                "RSTL litres (L)": ox.Sold.map(n0).values, "Share outside": ox.sh.map(pc).values,
+                "Margin excluded, pre-financing (GHS)": (S[S.ID.isin(ox.index)].groupby("ID").apply(lambda d: (d.GMAll - d.GM).sum(), include_groups=False).reindex(ox.index)).map(n0).values})))
 
     # ---- product & depot mix
     s4 = Section("mix", "Product, facility and depot mix")
@@ -131,16 +147,18 @@ def build_sections(R):
     s6 = Section("funding", "Funding and exposure", kpis=[
         ("Product purchased", f"GHS {t['inv']/1e6:,.1f}m", ""), ("Own cash", f"GHS {t['own']/1e6:,.1f}m", f"{t['own']/t['inv']:.1%} of invoices"),
         ("Bank facility", f"GHS {t['loan']/1e6:,.1f}m", f"GHS {t['impact']/1e6:,.1f}m drawn down"), ("Loan still open", f"GHS {t['rem']/1e6:,.1f}m", ""),
-        ("Interest recorded", f"GHS {t['rec']/1e6:,.2f}m", f"at {t['rate']:.2%} p.a. implied"), ("Interest estimated", f"GHS {(t['est']+t['accr'])/1e6:,.2f}m", "missing drawdowns and open loans")])
+        ("Financing cost in report", f"GHS {t['fin']/1e6:,.2f}m", "Workbook Facility Cost" if t["fin_source"] == "workbook" else "Rebuilt from PURCHASES"),
+        ("Interest per PURCHASES", f"GHS {t['fin_p']/1e6:,.2f}m", f"booked {t['rec']/1e6:,.2f}m, estimated {(t['est']+t['accr'])/1e6:,.2f}m")])
     s6.figs += [
         _fig("Product purchased by month and how it was funded", f"Own cash funded {t['own']/t['inv']:.0%} of purchases; the bank facility the rest.", C.funding_by_month(R)),
-        _fig("Financing cost by trade", f"GHS {t['fin']/1e6:,.2f}m in total, of which GHS {(t['est']+t['accr'])/1e6:,.2f}m is estimated.", C.interest_by_trade(R)),
-        _fig("Outstanding loan", f"GHS {t['rem']/1e6:,.1f}m of facility is still open; these trades are provisional.", C.open_loans(R))]
+        _fig("Financing cost by trade", (f"Workbook Facility Cost totals GHS {t['fin_w']/1e6:,.2f}m against GHS {t['fin_p']/1e6:,.2f}m of interest per PURCHASES; the totals agree closely but trades differ."
+                                          if t["fin_source"] == "workbook" else f"GHS {t['fin']/1e6:,.2f}m in total, of which GHS {(t['est']+t['accr'])/1e6:,.2f}m is estimated."), C.interest_by_trade(R)),
+        _fig("Outstanding loan", _open_caption(R), C.open_loans(R))]
     s6.figs = [x for x in s6.figs if x]
     ft = T.copy()
     s6.tables.append(Tbl("Funding by trade (GHS)", pd.DataFrame({
         "Trade": ft.index, "Invoice": ft.Invoice.map(n0).values, "Own cash": ft.Own.map(n0).values, "Bank loan": ft.Loan.map(n0).values,
-        "Drawn down": ft.Impact.map(n0).values, "Interest recorded": ft.Rec.map(n0).values, "Estimated / accrued": (ft.Est + ft.Accr).map(n0).values,
+        "Drawn down": ft.Impact.map(n0).values, "Facility Cost (sheet)": ft.FinW.map(n0).values, "Interest per PURCHASES": ft.FinP.map(n0).values,
         "Outstanding": ft.Remaining.map(n0).values})))
 
     # ---- notes
@@ -149,6 +167,26 @@ def build_sections(R):
     for s in secs:
         s.figs = [x for x in s.figs if x]
     return secs, period
+
+
+def _open_caption(R):
+    T, t = R["T"], R["tot"]; o = T[T.Status == "Open"]
+    if o.empty:
+        return "No facility is outstanding."
+    stock = (o.Remaining / o.CPL)
+    return (f"GHS {t['rem']/1e6:,.1f}m of facility is still open, backed by {stock.sum()/1e6:,.2f}m L of stock held by the bank awaiting release ("
+            + ", ".join(f"{i} {v/1e6:,.2f}m L" for i, v in stock.items()) + "). These trades are provisional.")
+
+
+def _prod_caption(R):
+    S = R["S"]; S = S[~S.Loss]
+    tot = S.groupby("Prod").NM.sum().sort_values(ascending=False)
+    g = S.groupby(["Month", "Prod"]).NM.sum().unstack().reindex(R["M"].index)
+    full = g[~R["M"].Partial] if (~R["M"].Partial).sum() else g
+    top = tot.index[0]
+    return (f"{top} is the largest earner at GHS {tot.iloc[0]/1e6:,.1f}m of GHS {tot.sum()/1e6:,.1f}m ("
+            f"{tot.iloc[0]/tot.sum():.0%}); " + ", ".join(f"{p} GHS {v/1e6:,.1f}m" for p, v in tot.iloc[1:].items())
+            + f". Best full month: {full.sum(axis=1).idxmax().strftime("%B")} (GHS {full.sum(axis=1).max()/1e6:,.1f}m).")
 
 
 def _half(R):

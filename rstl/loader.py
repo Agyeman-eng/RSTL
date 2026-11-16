@@ -14,6 +14,14 @@ DEPOT_MAP = {"BOST - APD": "BOST", "BOST - KUMASI": "BOST", "BOST - BUIPE": "BOS
              "TOR - PETHUB": "PETHUB", "VANA": "TOR"}
 
 
+def funder(tid):
+    """FAB trades are A001, A002...; others use their prefix (OMNI-001 -> OMNI)."""
+    if re.fullmatch(r"A\d+.*", tid):
+        return "FAB"
+    m = re.match(r"([A-Za-z]+)", tid)
+    return m.group(1).upper() if m else "Other"
+
+
 def _sheet(xl, name):
     for s in xl.sheet_names:
         if s.strip().lower() == name:
@@ -29,6 +37,24 @@ def _col(df, *names):
     raise ValueError(f"Missing column (tried {names}). Found: {list(df.columns)[:20]}")
 
 
+def _opt(df, *names):
+    """Optional column: the sheet's values if present, else NaN."""
+    try:
+        return df[_col(df, *names)]
+    except ValueError:
+        return pd.Series(float("nan"), index=df.index)
+
+
+def facility_ok(S):
+    """True when the workbook's Facility Cost is a clean per-litre figure and Total Cost/Ltr adds up on (almost) every row."""
+    if S.Fac.isna().all() or S.TC.isna().all():
+        return False
+    if S.Fac.max() >= 1:  # totals mixed in with per-litre values (older, uncleaned sheets)
+        return False
+    ok = ((S.CP + S.Fac.fillna(0) + S.Var + S.CM - S.TC).abs() < 1e-4)
+    return bool(ok.mean() > 0.99)
+
+
 def load(file):
     xl = pd.ExcelFile(file)
     s, p = _sheet(xl, "sales"), _sheet(xl, "purchases")
@@ -40,7 +66,9 @@ def load(file):
         "Qty": s[_col(s, "Quantity")], "SP": s[_col(s, "Selling Price")],
         "Rev": s[_col(s, "Sales Revenue")], "CP": s[_col(s, "Cost Price")],
         "Var": s[_col(s, "VARIABLE LICENSE + OTHER COSTS")].fillna(0),
-        "CM": s[_col(s, "CM cost/ Ltr", "CM cost/Ltr")].fillna(0)})
+        "CM": s[_col(s, "CM cost/ Ltr", "CM cost/Ltr")].fillna(0),
+        "Fac": _opt(s, "Facility Cost"), "TC": _opt(s, "Total Cost/Ltr", "Total Cost/ Ltr", "Total Cost"),
+        "TM": _opt(s, "Total Margin")})
     S = S.dropna(subset=["ID", "Date", "Qty"])
     S = S[S.ID.str.lower() != "nan"]
     S["Depot"] = S.Depot.replace({k.upper(): v for k, v in DEPOT_MAP.items()})
@@ -58,8 +86,39 @@ def load(file):
     return S, P
 
 
+def load_rstl_qty(file):
+    """RSTL-only litres per trade: Sheet4 'Total OMC loadings'. In the workbook this is the SALES total for the trade
+    minus litres bought outside RSTL (the portal does not separate RSTL stock from other stock). Returns None if unavailable."""
+    try:
+        h = _sheet(pd.ExcelFile(file), "sheet4")
+        idc, qc = _col(h, "ID"), _col(h, "Total OMC loadings")
+    except ValueError:
+        return None
+    h = h.dropna(subset=[idc])
+    s = pd.Series(pd.to_numeric(h[qc], errors="coerce").values, index=h[idc].astype(str).str.strip()).dropna()
+    s = s[~s.index.duplicated()]
+    return s if len(s) else None
+
+
+def infer_rates(P):
+    """Implied annual rate per funder, from drawdowns that already carry booked interest.
+    Each facility can carry its own rate (e.g. FAB 13.03%, OMNI 13.59%)."""
+    by = {}
+    for tid, g in P.groupby("ID"):
+        by.setdefault(funder(tid), []).append(g)
+    allr = {f: _implied(pd.concat(gs)) for f, gs in by.items()}
+    pool = [r for v in allr.values() for r in v]
+    fallback = float(np.median(pool)) if pool else 0.1303
+    return {f: (float(np.median(v)) if v else fallback) for f, v in allr.items()}
+
+
 def infer_rate(P):
-    """Implied annual rate from drawdowns that already carry booked interest."""
+    """Single overall rate (median across all funders)."""
+    r = list(infer_rates(P).values())
+    return float(np.median(r)) if r else 0.1303
+
+
+def _implied(P):
     rates = []
     for _, g in P.groupby("ID"):
         a = g[g.Status == "Actual"]
@@ -73,4 +132,4 @@ def infer_rate(P):
                 rates.append(r.Int * 365 / (bal * d))
             bal -= r.Pay
             prev = r.Date
-    return float(np.median(rates)) if rates else 0.1303
+    return rates
